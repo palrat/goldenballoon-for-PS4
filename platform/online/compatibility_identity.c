@@ -24,6 +24,10 @@
 #define MDKR_ONLINE_OS_TAG "windows"
 #elif defined(__linux__)
 #define MDKR_ONLINE_OS_TAG "linux"
+#elif defined(PLATFORM_PS4) || defined(__ORBIS__)
+/* Native PS4 port: deterministic like the other native builds (fixed tick,
+ * no floating-point variance across the audio/video clocks). */
+#define MDKR_ONLINE_OS_TAG "ps4"
 #else
 #error "online OS tag unmapped for this platform: prove its gameplay \
 determinism domain and add it here (and to the pinned unit vectors) before \

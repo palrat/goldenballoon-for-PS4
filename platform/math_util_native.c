@@ -563,3 +563,13 @@ static void mdkr64_fill_math_tables(void) {
         fflush(stderr);
     }
 }
+
+/* Explicit entry point for builds in which the constructor above does not
+ * exist. The PS4 build compiles with clang -cc1 without -fgnuc-version, so
+ * PRinternal/macros.h defines __attribute__(x) away and .init_array stays
+ * empty. Without this call the sine/arctan tables stay zero in .bss, and every
+ * camera basis built from them is a zero matrix: the world disappears while
+ * the HUD (which uses no rotation) stays intact. */
+void mdkr_native_init_math_tables(void) {
+    mdkr64_fill_math_tables();
+}
