@@ -17,6 +17,9 @@
  *      system modules are taken from the stick the same way, because copying
  *      them over FTP corrupts them. Every failure is shown as a PS4
  *      notification, not only written to the log.
+ *      File system calls go through stdio (works) or libkernel. The toolchain
+ *      libc's stat() and readdir() do not work on the console: stat() failed
+ *      for files that fopen() opens, so nothing was ever found.
  *   3. /data/dkr/flags.txt can set environment variables (a packaged app has
  *      no other way to receive them), e.g. MDKR_TRACE=2 + MDKR_DL_FRAME=<n>
  *      for a per-draw trace to diff against the desktop, MDKR_CAPTURE /
@@ -29,8 +32,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <strings.h>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <orbis/libkernel.h>
 #include "SDL.h"
 
@@ -178,18 +179,22 @@ static void ps4_notify(const char *text) {
     fflush(stderr);
 }
 
+/* Size of a readable regular file, or -1. */
 static long file_size(const char *path) {
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode) ? (long)st.st_size : -1;
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return -1;
+    long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    fclose(f);
+    return size;
 }
 
 static void mkdir_p(const char *path) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s", path);
     for (char *p = tmp + 1; *p != '\0'; p++) {
-        if (*p == '/') { *p = '\0'; mkdir(tmp, 0777); *p = '/'; }
+        if (*p == '/') { *p = '\0'; sceKernelMkdir(tmp, 0777); *p = '/'; }
     }
-    mkdir(tmp, 0777);
+    sceKernelMkdir(tmp, 0777);
 }
 
 static int copy_file(const char *src, const char *dst) {
@@ -208,8 +213,12 @@ static int copy_file(const char *src, const char *dst) {
     if (ferror(in)) ok = 0;
     fclose(in);
     if (fclose(out) != 0) ok = 0;
-    if (!ok || rename(tmp, dst) != 0) { unlink(tmp); return 0; }
-    return 1;
+    if (ok) {
+        sceKernelUnlink(dst);
+        ok = sceKernelRename(tmp, dst) == 0;
+    }
+    if (!ok) sceKernelUnlink(tmp);
+    return ok;
 }
 
 static int is_rom_name(const char *name) {
@@ -218,19 +227,78 @@ static int is_rom_name(const char *name) {
                            strcasecmp(dot, ".n64") == 0);
 }
 
-/* First 12 MB ROM image in dir (hidden files skipped: macOS writes ._name). */
+/* First 12 MB ROM image in dir (hidden files skipped: macOS writes ._name).
+ * Reads FreeBSD dirent records through sceKernelGetdents. */
+#define PS4_O_DIRECTORY 0x00020000
 static int find_rom_in(const char *dir, char *out, size_t cap) {
-    DIR *d = opendir(dir);
-    if (d == NULL) return 0;
-    struct dirent *e;
-    int found = 0;
-    while (!found && (e = readdir(d)) != NULL) {
-        if (e->d_name[0] == '.' || !is_rom_name(e->d_name)) continue;
-        snprintf(out, cap, "%s/%s", dir, e->d_name);
-        found = file_size(out) == ROM_SIZE;
+    int fd = sceKernelOpen(dir, PS4_O_DIRECTORY, 0);
+    if (fd < 0) return 0;
+    static char buf[4096];
+    int found = 0, n;
+    while (!found && (n = sceKernelGetdents(fd, buf, sizeof(buf))) > 0) {
+        for (int off = 0; !found && off + 8 <= n;) {
+            uint32_t fileno;
+            uint16_t reclen;
+            uint8_t namlen;
+            memcpy(&fileno, buf + off, sizeof(fileno));
+            memcpy(&reclen, buf + off + 4, sizeof(reclen));
+            namlen = (uint8_t)buf[off + 7];
+            if (reclen == 0) break;
+            char name[256];
+            memcpy(name, buf + off + 8, namlen);
+            name[namlen] = '\0';
+            off += reclen;
+            if (fileno == 0) continue;   /* deleted entry, still listed */
+            if (name[0] == '.' || !is_rom_name(name)) continue;
+            snprintf(out, cap, "%s/%s", dir, name);
+            long size = file_size(out);
+            fprintf(stderr, "[ps4] candidate %s size=%ld\n", out, size);
+            found = size == ROM_SIZE;
+        }
     }
-    closedir(d);
+    sceKernelClose(fd);
     return found;
+}
+
+/* The app's sandbox has no /mnt/usbN (opening it returns 0x80020002, "no
+ * such file"). GoldHEN's SDK call lifts the sandbox for the current process
+ * and restores it afterwards; only the USB lookup runs in between.
+ * struct jailbreak_backup and the command numbers are copied from
+ * GoldHEN_Plugins_SDK include/GoldHEN.h (MIT licence). */
+struct goldhen_jailbreak_backup {
+    uint32_t cr_uid, cr_ruid, cr_rgid, cr_groups;
+    uint64_t cr_paid;
+    uint64_t cr_caps[2];
+    void *cr_prison;
+    void *fd_cdir, *fd_jdir, *fd_rdir;
+};
+#define GOLDHEN_SDK_CMD_JAILBREAK   2
+#define GOLDHEN_SDK_CMD_UNJAILBREAK 3
+
+static long goldhen_sdk_cmd(uint64_t cmd, void *data) {
+    long ret;
+    __asm__ volatile("syscall"
+                     : "=a"(ret)
+                     : "a"(500L), "D"(cmd), "S"(data)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+static struct goldhen_jailbreak_backup s_jail;
+static int s_jailbroken;
+
+static void leave_sandbox(void) {
+    if (s_jailbroken) return;
+    long rc = goldhen_sdk_cmd(GOLDHEN_SDK_CMD_JAILBREAK, &s_jail);
+    s_jailbroken = rc == 0;
+    fprintf(stderr, "[ps4] leave sandbox (GoldHEN): %ld\n", rc);
+}
+
+static void enter_sandbox(void) {
+    if (!s_jailbroken) return;
+    long rc = goldhen_sdk_cmd(GOLDHEN_SDK_CMD_UNJAILBREAK, &s_jail);
+    s_jailbroken = 0;
+    fprintf(stderr, "[ps4] back in sandbox: %ld\n", rc);
 }
 
 /* USB sticks mount at /mnt/usb0../mnt/usb7; look in the root and in dkr/. */
@@ -260,10 +328,14 @@ static int locate_rom(char *rom, size_t cap, int *copied) {
     if (file_size(rom) > 0) return 1;
     if (find_rom_in(DATA_DIR, rom, cap)) return 1;
     char usb[512];
-    if (find_on_usb(NULL, usb, sizeof(usb))) {
+    leave_sandbox();
+    int on_usb = find_on_usb(NULL, usb, sizeof(usb));
+    if (on_usb) {
         fprintf(stderr, "[ps4] copying ROM from %s\n", usb);
         ps4_notify("Diddy Kong Racing: copying the ROM from the USB stick ...");
-        if (copy_file(usb, DEFAULT_ROM)) {
+        int ok = copy_file(usb, DEFAULT_ROM);
+        enter_sandbox();
+        if (ok) {
             snprintf(rom, cap, "%s", DEFAULT_ROM);
             *copied = 1;
             return 1;
@@ -271,6 +343,7 @@ static int locate_rom(char *rom, size_t cap, int *copied) {
         ps4_notify("Diddy Kong Racing: could not copy the ROM from the USB stick.");
         return 0;
     }
+    enter_sandbox();
     return 0;
 }
 
@@ -282,11 +355,14 @@ static void install_modules_from_usb(void) {
         char dst[256], src[512];
         snprintf(dst, sizeof(dst), "%s/%s", MODULE_DIR, kModules[i]);
         if (file_size(dst) > 4096) continue;
-        if (!find_on_usb(kModules[i], src, sizeof(src))) continue;
-        mkdir_p(MODULE_DIR);
-        fprintf(stderr, "[ps4] installing %s from %s: %s\n", kModules[i], src,
-                copy_file(src, dst) ? "ok" : "FAILED");
+        leave_sandbox();
+        if (find_on_usb(kModules[i], src, sizeof(src))) {
+            mkdir_p(MODULE_DIR);
+            fprintf(stderr, "[ps4] installing %s from %s: %s\n", kModules[i], src,
+                    copy_file(src, dst) ? "ok" : "FAILED");
+        }
     }
+    enter_sandbox();
 }
 
 static int modules_present(void) {
@@ -295,7 +371,7 @@ static int modules_present(void) {
 }
 
 int main(void) {
-    mkdir(DATA_DIR, 0777);
+    sceKernelMkdir(DATA_DIR, 0777);
     redirect_log();
     install_crash_handler();
 
@@ -371,7 +447,7 @@ int main(void) {
         }
         /* A ROM copied off the stick in this run is the likely culprit; remove it
          * so the next start looks at the stick again instead of reusing it. */
-        if (rom_copied) unlink(DEFAULT_ROM);
+        if (rom_copied) sceKernelUnlink(DEFAULT_ROM);
     }
     return rc;
 }

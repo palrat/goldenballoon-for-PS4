@@ -57,7 +57,9 @@ update or reinstall the game.
 
 ## Update to a new version
 
-Install the new `.pkg` the same way. Your saves and your ROM stay in place.
+Install the new `.pkg` the same way. The PS4 says the game is already
+installed and asks whether to install it again: choose **Yes**. Your saves and
+your ROM stay in place.
 
 ## If something goes wrong
 
