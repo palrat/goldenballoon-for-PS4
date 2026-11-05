@@ -29,16 +29,16 @@ cmake -B build-gl -DCMAKE_BUILD_TYPE=Release -DMDKR_WEBGPU_BACKEND=OFF
 export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis/PS4Toolchain
 
 # 3. Build and package. The number is the app version shown on the PS4.
-./platform/ps4/release.sh 04.00
+./platform/ps4/release.sh 01.00
 ```
 
-The result is `build-ps4/DKR-04.00.pkg`.
+The result is `build-ps4/DKR-01.00.pkg`.
 
 To install it on the console in the same step, open the **Remote Package
 Installer** app on the PS4, make sure GoldHEN's FTP server is on, and run:
 
 ```bash
-PS4_IP=<your PS4's IP address> ./platform/ps4/release.sh 04.00
+PS4_IP=<your PS4's IP address> ./platform/ps4/release.sh 01.00
 ```
 
 ## What is PS4-specific
