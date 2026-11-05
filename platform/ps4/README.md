@@ -1,7 +1,7 @@
 # Building the PS4 package
 
-Players do not need this: download the ready `.pkg` instead (see
-[PS4.md](../../PS4.md)). This page is for building it yourself on Linux.
+Players do not need this: download the ready `.pkg` instead (see the
+[guide on the main page](https://github.com/palrat/goldenballoon-for-PS4)). This page is for building it yourself on Linux.
 
 ## Requirements
 
@@ -18,8 +18,8 @@ Players do not need this: download the ready `.pkg` instead (see
 ## Build
 
 ```bash
-git clone https://github.com/palrat/goldenballoon.git
-cd goldenballoon
+git clone https://github.com/palrat/goldenballoon-for-PS4.git
+cd goldenballoon-for-PS4
 
 # 1. Configure the desktop build once. The PS4 build reuses its source list
 #    and the third-party sources CMake downloads here; nothing has to be built.

@@ -1,7 +1,9 @@
 # Diddy Kong Racing on PS4
 
-A native PS4 version of [Golden Balloon](README.md), the Diddy Kong Racing
-source port. It is not an emulator: the game runs as a normal PS4 app, in
+**[⬇ Download the latest release](https://github.com/palrat/goldenballoon-for-PS4/releases/latest)**
+
+A native PS4 version of [Golden Balloon](https://github.com/akratch/goldenballoon),
+the Diddy Kong Racing source port. It is not an emulator: the game runs as a normal PS4 app, in
 1080p widescreen.
 
 **No game files are included.** You need your own copy of the original game
@@ -32,7 +34,7 @@ source port. It is not an emulator: the game runs as a normal PS4 app, in
 ## Install
 
 1. Download `DKR-PS4-vX.Y.pkg` from the
-   [Releases page](../../releases/latest).
+   [Releases page](https://github.com/palrat/goldenballoon-for-PS4/releases/latest).
 2. Copy these files onto the **top level** of the USB stick (not into a
    folder):
    - `DKR-PS4-vX.Y.pkg`
@@ -85,7 +87,9 @@ like PS4Xplorer).
 
 ## For developers
 
-How to build the package yourself: [platform/ps4/README.md](platform/ps4/README.md).
+How to build the package yourself: [platform/ps4/README.md](https://github.com/palrat/goldenballoon-for-PS4/blob/main/platform/ps4/README.md).
+The original Golden Balloon README (desktop and browser versions) is
+[README.md](https://github.com/palrat/goldenballoon-for-PS4/blob/main/README.md).
 
 ## Credits
 
