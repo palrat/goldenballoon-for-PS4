@@ -1682,6 +1682,20 @@ static inline void *dkr_retain_resolved_pointer(void *resolved) {
     return resolved;
 }
 
+/* A pushed G_DL or a G_DMADL whose target does not resolve is skipped as an
+ * "absent child". That is legitimate for a genuinely null target and silent
+ * data loss for a real pointer the resolver cannot map -- the PS4 skipped every
+ * dRenderSettings* list that way (see stubs_dkr.c, "LOW-IMAGE HOSTS"). Name the
+ * first few non-zero tokens once; costs nothing while nothing fails. */
+static void dkr_note_null_child(const Gfx *cmd) {
+    static int s_logged;
+    if (cmd->words.w1 == 0u || s_logged >= 8) return;
+    s_logged++;
+    fprintf(stderr, "[DLNULL] op=%02x tok=0x%08x unresolved child skipped\n",
+            (unsigned)(cmd->words.w0 >> 24), (unsigned)cmd->words.w1);
+    fflush(stderr);
+}
+
 static inline void *dkr_resolve(uint32_t addr) {
     if (addr == 0) {
         return NULL;
@@ -7531,6 +7545,8 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
              */
             if (sub != NULL) {
                 dkr_run_dl(sub, depth + 1, 0);
+            } else {
+                dkr_note_null_child(cmd);
             }
             break;
         }
@@ -7545,6 +7561,8 @@ static void dkr_run_dl(Gfx *cmd, int depth, int limit) {
             } else if (sub != NULL) {
                 /* A null optional DMA child is absent, as for pushed G_DL. */
                 dkr_run_dl(sub, depth + 1, count);
+            } else {
+                dkr_note_null_child(cmd);
             }
             break;
         }
@@ -9038,13 +9056,22 @@ void gfx_set_dimensions(uint32_t width, uint32_t height) {
     gfx_output_dimensions.height = height;
     gfx_output_dimensions.aspect_ratio = (float)width / (float)height;
 
+    /* Only multiply the render dimensions when the backend can resolve the
+     * scaled frame back down. With no scene target (GLES 2.0) the multiply
+     * renders the world at 2x into an unscaled window: measured on the console,
+     * world draws ran at viewport 3840x2160 inside a 1920x1080 frame while the
+     * HUD kept 1920x1080 -- the world was simply off-screen. */
     {
-        unsigned int scaled_w;
-        unsigned int scaled_h;
-        gfx_render_scaled_dimensions(
-            width, height, max_dimension, &scaled_w, &scaled_h);
-        width = scaled_w;
-        height = scaled_h;
+        extern int gfx_gl_no_scene_target(void) __attribute__((weak));
+        int can_scale = (gfx_gl_no_scene_target == 0) || !gfx_gl_no_scene_target();
+        if (can_scale) {
+            unsigned int scaled_w;
+            unsigned int scaled_h;
+            gfx_render_scaled_dimensions(
+                width, height, max_dimension, &scaled_w, &scaled_h);
+            width = scaled_w;
+            height = scaled_h;
+        }
     }
 
     render_changed =

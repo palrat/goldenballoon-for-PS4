@@ -936,10 +936,131 @@ static void sdl_apply_gl_present_policy(void) {
                             (tearing && effective == 0)) ? 1 : 0);
 }
 
+/* glad is generated for desktop GL: under a GLES context it leaves entry points
+   NULL, including ES2 core functions such as glBindFramebuffer. Re-resolve every
+   function this engine uses through SDL and report whatever is still missing —
+   a named list instead of a NULL-pointer fault at the first call.
+   (GLES3-only names legitimately stay NULL on Piglet: the backend shims them.) */
+static void sdl_resolve_gl_pointers(void) {
+    static const struct {
+        const char *name;
+        void **slot;
+    } table[] = {
+        { "glActiveTexture", (void **)&glad_glActiveTexture },
+        { "glAttachShader", (void **)&glad_glAttachShader },
+        { "glBindAttribLocation", (void **)&glad_glBindAttribLocation },
+        { "glBindBuffer", (void **)&glad_glBindBuffer },
+        { "glBindFramebuffer", (void **)&glad_glBindFramebuffer },
+        { "glBindRenderbuffer", (void **)&glad_glBindRenderbuffer },
+        { "glBindTexture", (void **)&glad_glBindTexture },
+        { "glBlendFunc", (void **)&glad_glBlendFunc },
+        { "glBlitFramebuffer", (void **)&glad_glBlitFramebuffer },
+        { "glBufferData", (void **)&glad_glBufferData },
+        { "glBufferSubData", (void **)&glad_glBufferSubData },
+        { "glCheckFramebufferStatus", (void **)&glad_glCheckFramebufferStatus },
+        { "glClear", (void **)&glad_glClear },
+        { "glClearColor", (void **)&glad_glClearColor },
+        { "glColorMask", (void **)&glad_glColorMask },
+        { "glCompileShader", (void **)&glad_glCompileShader },
+        { "glCopyTexSubImage2D", (void **)&glad_glCopyTexSubImage2D },
+        { "glCreateProgram", (void **)&glad_glCreateProgram },
+        { "glCreateShader", (void **)&glad_glCreateShader },
+        { "glCullFace", (void **)&glad_glCullFace },
+        { "glDeleteBuffers", (void **)&glad_glDeleteBuffers },
+        { "glDeleteFramebuffers", (void **)&glad_glDeleteFramebuffers },
+        { "glDeleteProgram", (void **)&glad_glDeleteProgram },
+        { "glDeleteRenderbuffers", (void **)&glad_glDeleteRenderbuffers },
+        { "glDeleteShader", (void **)&glad_glDeleteShader },
+        { "glDeleteTextures", (void **)&glad_glDeleteTextures },
+        { "glDepthFunc", (void **)&glad_glDepthFunc },
+        { "glDepthMask", (void **)&glad_glDepthMask },
+        { "glDisable", (void **)&glad_glDisable },
+        { "glDisableVertexAttribArray", (void **)&glad_glDisableVertexAttribArray },
+        { "glDrawArrays", (void **)&glad_glDrawArrays },
+        { "glDrawBuffer", (void **)&glad_glDrawBuffer },
+        { "glEnable", (void **)&glad_glEnable },
+        { "glEnableVertexAttribArray", (void **)&glad_glEnableVertexAttribArray },
+        { "glFinish", (void **)&glad_glFinish },
+        { "glFramebufferRenderbuffer", (void **)&glad_glFramebufferRenderbuffer },
+        { "glFramebufferTexture2D", (void **)&glad_glFramebufferTexture2D },
+        { "glFramebufferTextureLayer", (void **)&glad_glFramebufferTextureLayer },
+        { "glGenBuffers", (void **)&glad_glGenBuffers },
+        { "glGenFramebuffers", (void **)&glad_glGenFramebuffers },
+        { "glGenRenderbuffers", (void **)&glad_glGenRenderbuffers },
+        { "glGenTextures", (void **)&glad_glGenTextures },
+        { "glGetAttribLocation", (void **)&glad_glGetAttribLocation },
+        { "glGetBooleanv", (void **)&glad_glGetBooleanv },
+        { "glGetError", (void **)&glad_glGetError },
+        { "glGetFloatv", (void **)&glad_glGetFloatv },
+        { "glGetIntegerv", (void **)&glad_glGetIntegerv },
+        { "glGetProgramInfoLog", (void **)&glad_glGetProgramInfoLog },
+        { "glGetProgramiv", (void **)&glad_glGetProgramiv },
+        { "glGetShaderInfoLog", (void **)&glad_glGetShaderInfoLog },
+        { "glGetShaderiv", (void **)&glad_glGetShaderiv },
+        { "glGetString", (void **)&glad_glGetString },
+        { "glGetTexLevelParameteriv", (void **)&glad_glGetTexLevelParameteriv },
+        { "glGetUniformLocation", (void **)&glad_glGetUniformLocation },
+        { "glIsEnabled", (void **)&glad_glIsEnabled },
+        { "glLinkProgram", (void **)&glad_glLinkProgram },
+        { "glPixelStorei", (void **)&glad_glPixelStorei },
+        { "glPolygonMode", (void **)&glad_glPolygonMode },
+        { "glPolygonOffset", (void **)&glad_glPolygonOffset },
+        { "glReadBuffer", (void **)&glad_glReadBuffer },
+        { "glReadPixels", (void **)&glad_glReadPixels },
+        { "glRenderbufferStorageMultisample", (void **)&glad_glRenderbufferStorageMultisample },
+        { "glScissor", (void **)&glad_glScissor },
+        { "glShaderSource", (void **)&glad_glShaderSource },
+        { "glStencilFunc", (void **)&glad_glStencilFunc },
+        { "glStencilMask", (void **)&glad_glStencilMask },
+        { "glStencilOp", (void **)&glad_glStencilOp },
+        { "glTexImage2D", (void **)&glad_glTexImage2D },
+        { "glTexImage3D", (void **)&glad_glTexImage3D },
+        { "glTexParameterf", (void **)&glad_glTexParameterf },
+        { "glTexParameteri", (void **)&glad_glTexParameteri },
+        { "glUniform1f", (void **)&glad_glUniform1f },
+        { "glUniform1i", (void **)&glad_glUniform1i },
+        { "glUniform2f", (void **)&glad_glUniform2f },
+        { "glUniform3f", (void **)&glad_glUniform3f },
+        { "glUniform4f", (void **)&glad_glUniform4f },
+        { "glUniformMatrix4fv", (void **)&glad_glUniformMatrix4fv },
+        { "glUseProgram", (void **)&glad_glUseProgram },
+        { "glVertexAttribPointer", (void **)&glad_glVertexAttribPointer },
+        { "glViewport", (void **)&glad_glViewport },
+    };
+    int missing = 0;
+    for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
+        void *fn = (void *)SDL_GL_GetProcAddress(table[i].name);
+        if (fn != NULL) {
+            *table[i].slot = fn;
+        } else {
+            if (missing == 0) {
+                fprintf(stderr, "[SDL] GL entry points still missing:");
+            }
+            fprintf(stderr, " %s", table[i].name);
+            missing++;
+        }
+    }
+    if (missing > 0) {
+        fprintf(stderr, " (%d of %d)\n", missing, (int)(sizeof(table) / sizeof(table[0])));
+    } else {
+        fprintf(stderr, "[SDL] GL entry points resolved (%d)\n", (int)(sizeof(table) / sizeof(table[0])));
+    }
+}
+
 static int sdl_init_gl(Uint32 base_flags) {
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    /* MDKR_GL_PROFILE=es|es3 forces a real GLES context; `es` (2.0, GLSL ES 1.00)
+       is the closest desktop stand-in for the PS4's Piglet. Default stays core 3.3. */
+    const char *gl_profile_env = getenv("MDKR_GL_PROFILE");
+    if (gl_profile_env != NULL && strncmp(gl_profile_env, "es", 2) == 0) {
+        const int es_major = (gl_profile_env[2] == '3') ? 3 : 2;
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, es_major);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, (es_major == 3) ? 2 : 0);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    } else {
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    }
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
 
@@ -969,6 +1090,7 @@ static int sdl_init_gl(Uint32 base_flags) {
         g_sdlWindow = NULL;
         return -1;
     }
+    sdl_resolve_gl_pointers();
     sdl_apply_gl_present_policy();
     s_glReady = 1;
     printf("[SDL] GL ready: %s / %s\n",

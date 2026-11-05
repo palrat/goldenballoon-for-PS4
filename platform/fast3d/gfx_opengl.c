@@ -123,10 +123,66 @@ static int shader_program_pool_cap;
 
 /* T10 telemetry: report the session's final shader-variant count (the
  * pre-dbd3c06 fixed pool corrupted state past 256 variants). */
+/* Piglet compiles synchronously (~110 ms per program measured on hardware) and
+ * exposes no program-binary extension, so the program cannot be cached the way
+ * Conker caches its Vulkan pipelines. It can still be moved: every program used
+ * in a session is written here at exit, and the next start compiles them all
+ * before the first frame instead of the first time a material shows up.
+ * Self-bootstrapping: the first run learns the list, later runs use it. */
+#define GFX_SHADER_WARM_LIST "/data/dkr/shader_ids.txt"
+
+/* Defined further down; the warm path below needs them before their bodies. */
+static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint64_t shader_id0,
+                                                                 uint32_t shader_id1);
+static struct ShaderProgram *gfx_opengl_lookup_shader(uint64_t shader_id0, uint32_t shader_id1);
+static void gfx_opengl_write_shader_warm_list(void);
+static void gfx_opengl_append_shader_warm_entry(uint64_t shader_id0, uint32_t shader_id1);
+
+static bool gfx_gl_shader_warm_enabled(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("MDKR_SHADER_WARM") != NULL ? 1 : 0;
+    return on != 0;
+}
+
+/* Set while the list itself is being replayed: those programs are already in
+ * the file and must not be appended a second time. */
+static bool s_shader_warming;
+
+void gfx_gl_shader_warm_cache(void) {
+    if (!gfx_gl_shader_warm_enabled()) return;
+    FILE *f = fopen(GFX_SHADER_WARM_LIST, "r");
+    if (f == NULL) {
+        fprintf(stderr, "[SHADER] warm list not readable yet: %s\n", GFX_SHADER_WARM_LIST);
+        return;
+    }
+    int made = 0, known = 0;
+    unsigned long long id0;
+    unsigned id1;
+    s_shader_warming = true;
+    while (fscanf(f, "%llu %u", &id0, &id1) == 2) {
+        if (gfx_opengl_lookup_shader((uint64_t)id0, (uint32_t)id1) != NULL) {
+            known++;
+            continue;
+        }
+        gfx_opengl_create_and_load_new_shader((uint64_t)id0, (uint32_t)id1);
+        made++;
+    }
+    s_shader_warming = false;
+    fclose(f);
+    /* Earlier builds appended every program on every start, so the list grew
+     * by a full copy per session. Rewrite it with one line per program. */
+    if (known > 0) gfx_opengl_write_shader_warm_list();
+    fprintf(stderr, "[SHADER] warm-up: %d compiled, %d duplicate entries dropped\n",
+            made, known);
+    fflush(stderr);
+}
+
 static void gfx_opengl_log_shader_pool_size_at_exit(void) {
     fprintf(stderr, "[fast3d] GL shader pool final size: %d variant(s)%s\n",
             shader_program_pool_size,
             shader_program_pool_size > 256 ? " (EXCEEDS old fixed pool of 256)" : "");
+    if (!gfx_gl_shader_warm_enabled()) return;
+    gfx_opengl_write_shader_warm_list();
 }
 
 /* W1.E3 (T2/T4): sun shadow depth-only pass + receiver state (capture-and-replay,
@@ -142,6 +198,9 @@ static GLuint g_shadow_vbo;        /* dynamic caster-geometry upload */
 static GLuint g_shadow_vao;
 static GfxShadowPlan g_shadow_plan;
 static int g_shadow_receiver_view = -1;
+/* defined further down (GLES 2.0 detection), used by early state helpers */
+static bool gb_gles2_context(void);
+
 static GLuint opengl_vbo;
 static GLuint opengl_vao;
 static struct ShaderProgram *current_shader_program;
@@ -606,6 +665,13 @@ static void gfx_opengl_vertex_array_set_attribs(struct ShaderProgram *prg) {
     size_t num_floats = prg->num_floats;
     size_t pos = 0;
 
+    /* Without VAOs (ES 2.0) the attribute pointers bind to whatever buffer is
+     * current, so the core VBO must be bound here — other passes (output filter,
+     * shadow map) legitimately leave their own buffer bound. */
+    if (gb_gles2_context() && opengl_vbo != 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
+    }
+
     for (int i = 0; i < prg->num_attribs; i++) {
         /* A declared-but-dead attribute (e.g. aWorldPos with no live consumer under
          * GE007_FORCE_WORLD_ATTRS + diag off) can link to location -1. Skip the GL
@@ -880,6 +946,195 @@ static void append_line(char *buf, size_t cap, size_t *len, const char *str) {
     memcpy(buf + *len, str, n);
     *len += n;
     buf[(*len)++] = '\n';
+}
+
+/* --- GLES 2.0 VAO shim -----------------------------------------------------
+   Piglet is GLES 2.0 and has no vertex array objects; glad leaves the ES3-only
+   entry points NULL, so gfx_opengl_init died at the very first
+   glGenVertexArrays. On an ES 2.0 context the engine's few VAO calls become
+   no-ops: it sets one attribute layout per buffer, so the single global
+   attribute state is enough for the default path. */
+static bool gb_gles2_context(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *ver = (const char *)glGetString(GL_VERSION);
+        cached = (ver != NULL && strstr(ver, "ES 2.0") != NULL) ? 1 : 0;
+        if (cached) {
+            fprintf(stderr, "[fast3d] GLES 2.0 context: VAOs unavailable, shim active\n");
+        }
+    }
+    return cached == 1;
+}
+
+/* ES 2.0 has no sized internal formats (those arrived with ES 3): GL_RGBA8,
+   GL_DEPTH_COMPONENT24 and packed GL_DEPTH24_STENCIL8 raise GL_INVALID_ENUM and
+   every texture upload fails — which is exactly how a port renders nothing while
+   audio and logic keep running. Map them to their unsized ES 2.0 equivalents. */
+/* GL_TEXTURE_BASE_LEVEL / GL_TEXTURE_MAX_LEVEL raised GL_INVALID_ENUM on ES 2.0
+   (both are ES 3 pnames) and poisoned the whole upload. ES 2.0 has level 0 only,
+   which is what every caller here wants anyway. */
+static void gb_set_level_range(GLenum target, GLint max_level) {
+    if (gb_gles2_context()) {
+        return;
+    }
+    glTexParameteri(target, GL_TEXTURE_BASE_LEVEL, 0);
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, max_level);
+}
+
+static GLint gb_es2_internal_format(GLenum fmt) {
+    if (!gb_gles2_context()) {
+        return (GLint)fmt;
+    }
+    switch (fmt) {
+        case GL_RGBA8:
+            return GL_RGBA;
+        case GL_DEPTH_COMPONENT24:
+            return GL_DEPTH_COMPONENT;
+        case GL_DEPTH24_STENCIL8:
+            return GL_DEPTH_COMPONENT; /* ES 2.0 has no packed depth-stencil */
+        default:
+            return (GLint)fmt;
+    }
+}
+
+static void gb_gen_vertex_arrays(GLsizei n, GLuint *arrays) {
+    if (gb_gles2_context()) {
+        for (GLsizei i = 0; i < n; i++) {
+            arrays[i] = 0;
+        }
+        return;
+    }
+    glGenVertexArrays(n, arrays);
+}
+
+static void gb_bind_vertex_array(GLuint array) {
+    if (gb_gles2_context()) {
+        (void)array;
+        return;
+    }
+    glBindVertexArray(array);
+}
+
+static void gb_delete_vertex_arrays(GLsizei n, const GLuint *arrays) {
+    if (gb_gles2_context()) {
+        (void)n;
+        (void)arrays;
+        return;
+    }
+    glDeleteVertexArrays(n, arrays);
+}
+
+/* Redirect every later use in this file. The wrappers above are defined before
+   these macros, so their own calls still reach the real GL entry points. */
+#undef glGenVertexArrays
+#undef glBindVertexArray
+#undef glDeleteVertexArrays
+#define glGenVertexArrays(n, p)         gb_gen_vertex_arrays((n), (p))
+#define glBindVertexArray(a)            gb_bind_vertex_array((a))
+#define glDeleteVertexArrays(n, p)      gb_delete_vertex_arrays((n), (p))
+
+/* --- GLSL ES 1.00 dialect shim -------------------------------------------
+   The generator in this file emits desktop-GL flavoured GLSL (#version 330
+   core / 150 / 320 es). Piglet accepts only GLSL ES 1.00, so on an ES 2.0
+   context the finished source is rewritten right before compilation.
+   MDKR_GLSL_DIALECT=es100 forces the same rewrite on a desktop ES context, so
+   the Piglet path can be reproduced locally (with MDKR_GL_PROFILE=es). */
+
+static bool gb_es100_wanted(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* An ES 2.0 context cannot compile desktop GLSL at all, so the rewrite
+         * is implied by the context, not by a variable. On the PS4 port there
+         * is nobody to set MDKR_GLSL_DIALECT — without this the first shader
+         * would be handed to Piglet as `#version 330 core` and fail. */
+        if (gb_gles2_context()) {
+            cached = 1;
+        } else {
+            const char *v = getenv("MDKR_GLSL_DIALECT");
+            cached = (v != NULL && strncmp(v, "es100", 5) == 0) ? 1 : 0;
+        }
+    }
+    return cached == 1;
+}
+
+static void gb_replace_all(char *buf, size_t cap, const char *from, const char *to) {
+    const size_t fl = strlen(from);
+    const size_t tl = strlen(to);
+    char *p = buf;
+    while ((p = strstr(p, from)) != NULL) {
+        const size_t tail = strlen(p + fl);
+        if (strlen(buf) + (tl - fl) + 1 >= cap) {
+            return; /* leave it unchanged rather than overflow */
+        }
+        memmove(p + tl, p + fl, tail + 1);
+        memcpy(p, to, tl);
+        p += tl;
+    }
+}
+
+static void gb_glsl_to_es100(char *src, size_t cap, int is_fragment) {
+    char *out = (char *)malloc(cap);
+    if (out == NULL) {
+        return;
+    }
+    size_t o = 0;
+    const char *p = src;
+
+    while (*p != '\0' && o + 4200 < cap) {
+        const char *nl = strchr(p, '\n');
+        const size_t n = (nl != NULL) ? (size_t)(nl - p) : strlen(p);
+        char line[4096];
+        const size_t take = n < sizeof(line) - 1 ? n : sizeof(line) - 1;
+        memcpy(line, p, take);
+        line[take] = '\0';
+        p += n + (nl != NULL ? 1 : 0);
+
+        char *q = line;
+        while (*q == ' ' || *q == '\t') {
+            q++;
+        }
+        if (strncmp(q, "#version", 8) == 0) {
+            o += (size_t)snprintf(out + o, cap - o, "#version 100\n");
+            continue;
+        }
+        if (is_fragment && strncmp(q, "out vec4 fragColor;", 19) == 0) {
+            continue; /* ES 1.00 has no user-declared fragment outputs */
+        }
+        if (is_fragment && strstr(q, "precision mediump float;") != NULL) {
+            continue; /* re-added exactly once below */
+        }
+        for (char *np = strstr(q, "noperspective "); np != NULL;
+             np = strstr(q, "noperspective ")) {
+            memmove(np, np + 14, strlen(np + 14) + 1);
+        }
+        o += (size_t)snprintf(out + o, cap - o, "%s\n", line);
+    }
+    out[o] = '\0';
+
+    if (is_fragment) {
+        gb_replace_all(out, cap, "\nout ", "\nvarying ");
+        gb_replace_all(out, cap, "\nin ", "\nvarying ");
+        gb_replace_all(out, cap, "fragColor", "gl_FragColor");
+    } else {
+        gb_replace_all(out, cap, "\nout ", "\nvarying ");
+        gb_replace_all(out, cap, "\nin ", "\nattribute ");
+    }
+    gb_replace_all(out, cap, "textureLod(", "texture2DLod(");
+    gb_replace_all(out, cap, "texture(", "texture2D(");
+
+    if (is_fragment) {
+        const char *ver = strstr(out, "#version 100");
+        if (ver != NULL) {
+            const size_t at = (size_t)(ver - out) + strlen("#version 100");
+            static const char kPrecision[] = "\nprecision mediump float;";
+            memmove(out + at + strlen(kPrecision), out + at, strlen(out + at) + 1);
+            memcpy(out + at, kPrecision, strlen(kPrecision));
+        }
+    }
+
+    strncpy(src, out, cap - 1);
+    src[cap - 1] = '\0';
+    free(out);
 }
 
 static const char *shader_item_to_str(uint32_t item, bool with_alpha, bool only_alpha, bool inputs_have_alpha, bool hint_single_element) {
@@ -1564,6 +1819,26 @@ static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint64_t shad
     vs_buf[vs_len] = '\0';
     fs_buf[fs_len] = '\0';
 
+    /* GLSL ES 1.00 for Piglet — see the shim above. */
+    if (gb_es100_wanted()) {
+        const size_t vcap = sizeof(vs_buf);
+        const size_t fcap = sizeof(fs_buf);
+        char *es_vs = (char *)malloc(vcap);
+        char *es_fs = (char *)malloc(fcap);
+        if (es_vs != NULL && es_fs != NULL) {
+            memcpy(es_vs, vs_buf, vs_len + 1);
+            memcpy(es_fs, fs_buf, fs_len + 1);
+            gb_glsl_to_es100(es_vs, vcap, 0);
+            gb_glsl_to_es100(es_fs, fcap, 1);
+            memcpy(vs_buf, es_vs, vcap);
+            memcpy(fs_buf, es_fs, fcap);
+            vs_len = strlen(vs_buf);
+            fs_len = strlen(fs_buf);
+            free(es_vs);
+            free(es_fs);
+        }
+    }
+
     /* Dump first few generated shaders */
     {
         static int shader_dump = 0;
@@ -1659,6 +1934,7 @@ static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint64_t shad
     /* Space is guaranteed by the grow check above: every program handed out is
      * reachable from the pool, so none can be orphaned. */
     shader_program_pool[shader_program_pool_size++] = prg;
+    gfx_opengl_append_shader_warm_entry(shader_id0, shader_id1);
     /* Variant-count telemetry (T10): the pre-dbd3c06 pool silently
      * wrapped at 256 and corrupted live combiners past that point.
      * One line at process exit measures how close a real session gets.
@@ -1870,6 +2146,25 @@ static int gfx_gl_has_mips(GLuint id) {
     return (id < GFX_GL_MAX_TRACKED_TEX) ? s_gl_tex_has_mips[id] : 0;
 }
 
+/* ES 2.0 forbids GL_REPEAT on non-power-of-two textures (ES 3 relaxed this).
+   N64 art is NPOT all over (font atlases, HUD strips), so the wrap mode has to
+   follow the texture, not just the RDP tile flags. */
+static uint8_t s_gl_tex_npot[GFX_GL_MAX_TRACKED_TEX];
+
+static void gfx_gl_set_npot(GLuint id, int npot) {
+    if (id < GFX_GL_MAX_TRACKED_TEX) {
+        s_gl_tex_npot[id] = (uint8_t) (npot ? 1 : 0);
+    }
+}
+
+static int gfx_gl_is_npot(GLuint id) {
+    return (id < GFX_GL_MAX_TRACKED_TEX) ? s_gl_tex_npot[id] : 0;
+}
+
+static int gfx_gl_dims_npot(int w, int h) {
+    return ((w & (w - 1)) != 0) || ((h & (h - 1)) != 0);
+}
+
 static void gfx_opengl_select_texture(int tile, GLuint texture_id) {
     glActiveTexture(GL_TEXTURE0 + tile);
     glBindTexture(GL_TEXTURE_2D, texture_id);
@@ -1896,16 +2191,16 @@ static bool gfx_opengl_upload_texture_mipped(const uint8_t *const *level_rgba,
     while (glGetError() != GL_NO_ERROR) {
     }
     for (int l = 0; l < level_count; l++) {
-        glTexImage2D(GL_TEXTURE_2D, l, GL_RGBA8, level_w[l], level_h[l], 0,
+        glTexImage2D(GL_TEXTURE_2D, l, gb_es2_internal_format(GL_RGBA8), level_w[l], level_h[l], 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, level_rgba[l]);
     }
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, level_count - 1);
+    gb_set_level_range(GL_TEXTURE_2D, level_count - 1);
     if (glGetError() != GL_NO_ERROR) {
         return false;
     }
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
     gfx_gl_set_has_mips((GLuint) bound, 1);
+    gfx_gl_set_npot((GLuint) bound, gfx_gl_dims_npot(level_w[0], level_h[0]));
     return true;
 }
 
@@ -1920,7 +2215,7 @@ static bool gfx_opengl_upload_texture(const uint8_t *rgba32_buf, int width, int 
     }
     while (glGetError() != GL_NO_ERROR) {
     }
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
+    glTexImage2D(GL_TEXTURE_2D, 0, gb_es2_internal_format(GL_RGBA8), width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
     {
         /* Texture ids are recycled by the HLE cache; a single-level upload into
          * a slot that previously held a chain must clear the flag or the sampler
@@ -1933,8 +2228,7 @@ static bool gfx_opengl_upload_texture(const uint8_t *rgba32_buf, int width, int 
      * particularly sensitive to incomplete mip state on frontend NPOT uploads
      * such as the 440x1 eye-intro strips, and will silently substitute a zero
      * texture when the object is considered unloadable. */
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    gb_set_level_range(GL_TEXTURE_2D, 0);
     GLenum err = glGetError();
     if (err != GL_NO_ERROR) {
         fprintf(stderr, "[GL-TEX-UPLOAD-ERR] width=%d height=%d err=0x%x\n", width, height, err);
@@ -1947,11 +2241,31 @@ static bool gfx_opengl_upload_texture(const uint8_t *rgba32_buf, int width, int 
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &actual_height);
     err = glGetError();
     if (err != GL_NO_ERROR || actual_width != width || actual_height != height) {
+        /* ES 2.0 cannot answer this query: glGetTexLevelParameteriv raises
+         * GL_INVALID_OPERATION for these NPOT strips and reports 0x0 even
+         * though the upload succeeded. Treating it as failure made the caller
+         * substitute a placeholder texture — visible as white boxes on the HUD
+         * and the track map. Accept the upload. */
+        if (gb_gles2_context()) {
+            while (glGetError() != GL_NO_ERROR) {
+            }
+            {
+                GLint bound_id = 0;
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_id);
+                gfx_gl_set_npot((GLuint) bound_id, gfx_gl_dims_npot(width, height));
+            }
+            return true;
+        }
         fprintf(stderr,
                 "[GL-TEX-UPLOAD-BAD] width=%d height=%d actual=%d,%d err=0x%x\n",
                 width, height, actual_width, actual_height, err);
         texDebugDumpRecentFireEvents(stderr);
         return false;
+    }
+    {
+        GLint bound_id = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound_id);
+        gfx_gl_set_npot((GLuint) bound_id, gfx_gl_dims_npot(width, height));
     }
     return true;
 }
@@ -1961,6 +2275,26 @@ static uint32_t gfx_cm_to_opengl(uint32_t val) {
         return GL_CLAMP_TO_EDGE;
     }
     return (val & G_TX_MIRROR) ? GL_MIRRORED_REPEAT : GL_REPEAT;
+}
+
+/* ES 2.0 wrap: MIRRORED_REPEAT is ES 3, and REPEAT on an NPOT texture is
+   undefined there — which is what turned glyph quads and the track map into
+   opaque black and white boxes. */
+static GLint gfx_cm_to_opengl_es2(int tile, uint32_t val) {
+    GLint base = (GLint) gfx_cm_to_opengl(val);
+    if (!gb_gles2_context()) {
+        return base;
+    }
+    if (base == GL_MIRRORED_REPEAT) {
+        base = GL_REPEAT;
+    }
+    /* REPEAT on an NPOT texture is invalid on ES 2.0; clamp is the only
+     * spec-conforming choice (forcing REPEAT was tried on hardware and looked
+     * worse). */
+    if (base == GL_REPEAT && tile >= 0 && tile < 2 && gfx_gl_is_npot(s_gl_bound_tex[tile])) {
+        base = GL_CLAMP_TO_EDGE;
+    }
+    return base;
 }
 
 static void gfx_opengl_set_sampler_parameters(int tile, bool linear_filter, uint32_t cms, uint32_t cmt) {
@@ -1975,8 +2309,16 @@ static void gfx_opengl_set_sampler_parameters(int tile, bool linear_filter, uint
          * The comment above describes why mips were off, not why they must
          * stay off — the chain is CPU-built now and glGenerateMipmap is never
          * called, so the NPOT failure it describes cannot occur. */
+        /* GLES 2.0 cannot answer "is this chain complete?" (no
+         * glGetTexLevelParameteriv), and an incomplete chain does not degrade
+         * to bilinear there — it samples as transparent black, so every
+         * alpha-tested texel is discarded and whole textured models vanish
+         * while untextured parts keep drawing. Stay on single-level filters on
+         * that path: no texture that survives the ES2 upload rules can be
+         * incomplete, and mipmaps cannot rescue a frame that loses its
+         * geometry. */
         int mipped = (tile >= 0 && tile < 2) && gfx_gl_has_mips(s_gl_bound_tex[tile]) &&
-                     !g_gfxSamplerLod0Only;
+                     !g_gfxSamplerLod0Only && !gb_gles2_context();
         GLint min_filter;
         if (mipped) {
             min_filter = linear_filter ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_NEAREST;
@@ -1986,8 +2328,8 @@ static void gfx_opengl_set_sampler_parameters(int tile, bool linear_filter, uint
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, min_filter);
     }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear_filter ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl(cms));
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl(cmt));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, gfx_cm_to_opengl_es2(tile, cms));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, gfx_cm_to_opengl_es2(tile, cmt));
     /* Enable anisotropic filtering if available — critical for textures
      * that tile many times at oblique angles (N64 room/terrain surfaces) */
     if (s_max_aniso < 0) {
@@ -2199,11 +2541,10 @@ static bool gfx_opengl_ensure_framebuffer_snapshot_texture(int width, int height
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    gb_set_level_range(GL_TEXTURE_2D, 0);
     if (g_diag_framebuffer_snapshot_w != width ||
         g_diag_framebuffer_snapshot_h != height) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, gb_es2_internal_format(GL_RGBA8), width, height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         g_diag_framebuffer_snapshot_w = width;
         g_diag_framebuffer_snapshot_h = height;
@@ -2515,6 +2856,9 @@ static void gfx_opengl_draw_triangles_cvg_wrap_stencil(size_t buf_vbo_num_tris) 
 static void gfx_opengl_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_t buf_vbo_num_tris) {
     if (current_shader_program != NULL) {
         gfx_opengl_set_uniforms(current_shader_program);
+    }
+    if (gb_gles2_context() && opengl_vbo != 0) {
+        glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
     }
     glBufferData(GL_ARRAY_BUFFER, sizeof(float) * buf_vbo_len, buf_vbo, GL_STREAM_DRAW);
     if (g_blend_alpha_rdp_memory || g_blend_alpha_rdp_cvg_memory) {
@@ -2897,6 +3241,16 @@ static bool gfx_opengl_output_ssao_active(void) {
 }
 
 static bool gfx_opengl_scene_target_enabled(void) {
+    /* GLES 2.0: render straight to the window. Measured on the ES2 path, the
+     * render-to-texture route silently loses texture colour — the same frame
+     * shows Diddy and his plane fully textured when drawn directly, and flat
+     * white through the scene FBO, with identical texture bindings, filters and
+     * wrap modes at every draw. Nothing here can be verified on that API
+     * (glGetTexLevelParameteriv is unavailable, blits are ES3), so the
+     * supersampling that needs this target is not worth losing the picture. */
+    if (gb_gles2_context()) {
+        return false;
+    }
     float render_scale = gfx_opengl_effective_render_scale();
     return g_pcRemasterFX ||
            render_scale > 1.001f ||
@@ -2906,6 +3260,15 @@ static bool gfx_opengl_scene_target_enabled(void) {
            gfx_diag_xlu_rdp_memory_blend_enabled() ||
            gfx_diag_xlu_rdp_cvg_memory_blend_enabled() ||
            gfx_opengl_room_xlu_cvg_memory_enabled();
+}
+
+/* Queried by the shared frame setup in gfx_pc_dkr.c: without a scene target
+ * there is nothing that can shrink a render-scaled frame back to the window, so
+ * the dimensions must not be multiplied in the first place. */
+int gfx_gl_no_scene_target(void);
+
+int gfx_gl_no_scene_target(void) {
+    return gfx_opengl_scene_target_enabled() ? 0 : 1;
 }
 
 static bool gfx_opengl_ensure_scene_target(int width, int height) {
@@ -3816,11 +4179,10 @@ static void gfx_opengl_ensure_filter_texture(GLuint *tex_id,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+    gb_set_level_range(GL_TEXTURE_2D, 0);
 
     if (*tex_w != width || *tex_h != height) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, gb_es2_internal_format(GL_RGBA8), width, height, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         *tex_w = width;
         *tex_h = height;
@@ -3961,6 +4323,12 @@ static void gfx_opengl_apply_output_vi_filter(void) {
     extern SDL_Window *g_sdlWindow;
     int drawable_w = 0;
     int drawable_h = 0;
+
+    /* ES 2.0: without a scene target there is no filtered source, and this
+       pass would sample an empty texture over the finished frame. */
+    if (gb_gles2_context()) {
+        return;
+    }
 
     glGetIntegerv(GL_VIEWPORT, viewport);
     if (g_sdlWindow != NULL) {
@@ -4169,7 +4537,7 @@ static bool gfx_opengl_init(void) {
 
     glGenBuffers(1, &opengl_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
-    if (opengl_vao == 0 || opengl_vbo == 0 || glGetError() != GL_NO_ERROR) {
+    if ((!gb_gles2_context() && opengl_vao == 0) || opengl_vbo == 0 || glGetError() != GL_NO_ERROR) {
         fprintf(stderr, "[fast3d] OpenGL init could not create core buffers\n");
         /* shutdown() is not reached for a backend that never came up, so this
          * path owns whatever it did create. */
@@ -4393,7 +4761,7 @@ static bool gfx_opengl_ensure_shadow_resources(int res, int layers) {
         glActiveTexture(GL_TEXTURE5);
         glBindTexture(GL_TEXTURE_2D_ARRAY, g_shadow_depth_tex);
         glTexImage3D(
-            GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24,
+            GL_TEXTURE_2D_ARRAY, 0, gb_es2_internal_format(GL_DEPTH_COMPONENT24),
             res, res, layers, 0,
             GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NULL);
         glTexParameteri(
@@ -5128,3 +5496,38 @@ struct GfxRenderingAPI gfx_opengl_api = {
     .upload_texture_mipped = gfx_opengl_upload_texture_mipped,
     .shutdown = gfx_opengl_shutdown,
 };
+
+/* Written at exit: every program this session compiled. Filled in with the
+ * shader_id pairs, so the next start can compile them during boot. */
+static void gfx_opengl_write_shader_warm_list(void) {
+    FILE *f = fopen(GFX_SHADER_WARM_LIST, "w");
+    if (f == NULL) return;
+    for (int i = 0; i < shader_program_pool_size; i++) {
+        if (shader_program_pool[i] == NULL) continue;
+        fprintf(f, "%llu %u\n",
+                (unsigned long long)shader_program_pool[i]->shader_id0,
+                (unsigned)shader_program_pool[i]->shader_id1);
+    }
+    fclose(f);
+}
+
+/* Appended as each program is created, not only at exit: the app is often
+ * killed rather than exited, and atexit never ran -- the warm list stayed empty
+ * and every start recompiled all seven programs. Programs replayed from the
+ * list are not appended again (s_shader_warming). */
+static uint64_t s_warm_logged[256];
+static int s_warm_logged_n;
+
+static void gfx_opengl_append_shader_warm_entry(uint64_t shader_id0, uint32_t shader_id1) {
+    if (!gfx_gl_shader_warm_enabled() || s_shader_warming) return;
+    uint64_t key = shader_id0 ^ ((uint64_t)shader_id1 << 32);
+    for (int i = 0; i < s_warm_logged_n; i++) {
+        if (s_warm_logged[i] == key) return;
+    }
+    if (s_warm_logged_n >= (int)(sizeof(s_warm_logged) / sizeof(s_warm_logged[0]))) return;
+    s_warm_logged[s_warm_logged_n++] = key;
+    FILE *f = fopen(GFX_SHADER_WARM_LIST, "a");
+    if (f == NULL) return;
+    fprintf(f, "%llu %u\n", (unsigned long long)shader_id0, (unsigned)shader_id1);
+    fclose(f);
+}
