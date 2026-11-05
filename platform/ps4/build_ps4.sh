@@ -181,6 +181,8 @@ IMAGE_SYMS=(--defsym=mdkr_image_data_start=ADDR\(.rodata\)
 echo "[ps4] elf: $(stat -c%s "$OUT/mdkr64.elf") bytes"
 
 export OO_PS4_TOOLCHAIN="$OO"
-"$OO/bin/linux/create-fself" -in="$OUT/mdkr64.elf" -out="$OUT/mdkr64.oelf" \
-    --eboot="$OUT/eboot.bin" --paid="$PAID" --authinfo="$AUTH_INFO"
+# Run from $OUT with relative names: create-fself stores the -in path verbatim
+# in the eboot's string table, which would publish the builder's home path.
+(cd "$OUT" && "$OO/bin/linux/create-fself" -in=mdkr64.elf -out=mdkr64.oelf \
+    --eboot=eboot.bin --paid="$PAID" --authinfo="$AUTH_INFO")
 echo "[ps4] eboot.bin: $(stat -c%s "$OUT/eboot.bin") bytes"
