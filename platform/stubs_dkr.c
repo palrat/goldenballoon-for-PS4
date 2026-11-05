@@ -323,6 +323,8 @@ void     *g_dkrArenaBase = NULL;
 uintptr_t g_dkrArenaHi   = 0;
 uint32_t  g_dkrArenaSize = 0;
 
+static void dkr_image_layout_check(void);
+
 void *dkr_arena_init(uint32_t size) {
     /* Align the block to its own size so [base, base+size) never straddles a
      * 4 GB boundary — then every arena pointer shares one high-32-bit value. */
@@ -369,6 +371,7 @@ void *dkr_arena_init(uint32_t size) {
     g_dkrArenaHi   = (uintptr_t)p & ~(uintptr_t)0xFFFFFFFFu;
     printf("[MEM] arena %u bytes @ %p (hi=0x%llx)\n",
            size, p, (unsigned long long)g_dkrArenaHi);
+    dkr_image_layout_check();
     return p;
 }
 
@@ -399,6 +402,94 @@ void *dkr_lo32_to_ptr(uint32_t lo32) {
  * recovered from the pointer registry, keyed on (u32)hostptr. Register exactly
  * those here so dkr_resolve's registry fallback can hand the full pointer back.
  * (PLAN decision 3: the store side owns registration at the conversion boundary.) */
+/* LOW-IMAGE HOSTS (PS4, any non-PIE LP64 build).
+ *
+ * The registration rule below used to be `p > 0xFFFFFFFF`: a value that fits in
+ * 32 bits was assumed to be an already-truncated token, never a host pointer.
+ * That holds for a Linux PIE desktop (image at 0x55..., heap at 0x7f...), and it
+ * is false on the PS4, where eboot.bin is loaded at 0x400000: every game global
+ * -- dRdpInit, dRspInit, gViewportStack, dMenuHudDrawModes and every
+ * dRenderSettings* table -- lives below 4 GB, was never registered, and its
+ * DL token (p ^ 0x80000000) resolved to NULL or into a segment base. The
+ * G_DL/G_DMADL handlers treat a NULL child as "absent", so the console silently
+ * skipped the lists that set the world's combiner and render mode. That is the
+ * single cause behind "the console walks DKR's world setup list far less often"
+ * and the whole family of default-material/render-mode substitutions that grew
+ * on top of it (measured: 100 % of world draws ran with the 2D texrect mode
+ * 00504240, frames 1500-1559, console build 02.x).
+ *
+ * So a pointer that is <= 4 GB but lies in the executable's own data range
+ * ([_etext, _end): .rodata, .data, .bss) is a real host pointer and registers
+ * like any other global. Tokens cannot be mistaken for it unless the arena's
+ * low-32 shadow intersects that range, which dkr_image_layout_check() reports
+ * at arena init; values inside that shadow keep the old token treatment.
+ * Bounds: on the desktop GNU ld PROVIDEs _etext/_end. The PS4 link (ld.lld
+ * with the SDK's link.x) defines neither, and `weak` cannot be used as a
+ * fallback there: clang -cc1 without -fgnuc-version leaves __GNUC__ undefined,
+ * so PRinternal/macros.h turns __attribute__(x) into nothing. build_ps4.sh
+ * therefore defines mdkr_image_data_start/_end with --defsym from the real
+ * section addresses (.rodata start, .bss end). */
+#if UINTPTR_MAX > UINT32_MAX && defined(__ELF__) && !defined(__EMSCRIPTEN__)
+#define DKR_LOW_IMAGE_REGISTRATION 1
+#if defined(PLATFORM_PS4)
+extern char mdkr_image_data_start[];
+extern char mdkr_image_data_end[];
+#define DKR_IMAGE_LO ((uintptr_t)mdkr_image_data_start)
+#define DKR_IMAGE_HI ((uintptr_t)mdkr_image_data_end)
+#else
+extern char _etext[] __attribute__((weak));
+extern char _end[] __attribute__((weak));
+#define DKR_IMAGE_LO ((uintptr_t)_etext)
+#define DKR_IMAGE_HI ((uintptr_t)_end)
+#endif
+#endif
+
+#if UINTPTR_MAX > UINT32_MAX
+static int dkr_host_ptr_should_register(uintptr_t p, int in_arena) {
+    if (in_arena) return 0;
+    if (p > 0xFFFFFFFFu) return 1;
+#ifdef DKR_LOW_IMAGE_REGISTRATION
+    if (DKR_IMAGE_LO != 0 && DKR_IMAGE_HI > DKR_IMAGE_LO) {
+        uintptr_t lo = DKR_IMAGE_LO, hi = DKR_IMAGE_HI;
+        if (p >= lo && p < hi) {
+            /* Inside the arena's low-32 shadow the value is ambiguous with an
+             * arena token; keep the historical token treatment there. */
+            uintptr_t base = (uintptr_t)g_dkrArenaBase;
+            if (base != 0) {
+                uint32_t a0 = (uint32_t)base;
+                uint32_t a1 = (uint32_t)(base + (uintptr_t)g_dkrArenaSize);
+                uint32_t q = (uint32_t)p;
+                if (a1 > a0 && q >= a0 && q < a1) return 0;
+            }
+            return 1;
+        }
+    }
+#endif
+    return 0;
+}
+#endif
+
+/* One line at arena init: where the image and the arena sit, and whether the
+ * arena's low-32 shadow intersects the image data range (which would make some
+ * tokens ambiguous). */
+static void dkr_image_layout_check(void) {
+#ifdef DKR_LOW_IMAGE_REGISTRATION
+    uintptr_t lo = DKR_IMAGE_LO;
+    uintptr_t hi = DKR_IMAGE_HI;
+    uintptr_t base = (uintptr_t)g_dkrArenaBase;
+    uint32_t a0 = (uint32_t)base;
+    uint32_t a1 = (uint32_t)(base + (uintptr_t)g_dkrArenaSize);
+    int low_image = hi != 0 && hi <= 0xFFFFFFFFu;
+    int overlap = low_image && a1 > a0 && (uintptr_t)a0 < hi && (uintptr_t)a1 > lo;
+    fprintf(stderr,
+            "[MEM] image data %p..%p (%s), arena shadow 0x%08x..0x%08x, "
+            "overlap=%d\n",
+            (void *)lo, (void *)hi, low_image ? "below 4 GB" : "above 4 GB",
+            (unsigned)a0, (unsigned)a1, overlap);
+    fflush(stderr);
+#endif
+}
+
 u32 dkr_k0_to_physical(const void *x) {
     uintptr_t p = (uintptr_t)x;
     uintptr_t base = (uintptr_t)g_dkrArenaBase;
@@ -418,7 +509,7 @@ u32 dkr_k0_to_physical(const void *x) {
      * dkr_resolve recovers ILP32 host pointers DIRECTLY from the token instead.
      * This registration stays LP64-only. */
 #if UINTPTR_MAX > UINT32_MAX
-    if (p > 0xFFFFFFFFu && !in_arena) {
+    if (dkr_host_ptr_should_register(p, in_arena)) {
         gfx_ptr_store_persistent(x);
     }
 #else
@@ -441,7 +532,7 @@ void dkr_dl_register_host_ptr(const void *x) {
     uintptr_t base = (uintptr_t)g_dkrArenaBase;
     int in_arena = p >= base && p < base + (uintptr_t)g_dkrArenaSize;
 #if UINTPTR_MAX > UINT32_MAX
-    if (p > 0xFFFFFFFFu && !in_arena) {
+    if (dkr_host_ptr_should_register(p, in_arena)) {
         gfx_ptr_store_persistent(x);
     }
 #else
