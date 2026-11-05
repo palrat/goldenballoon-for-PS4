@@ -9,8 +9,10 @@ source port. It is not an emulator: the game runs as a normal PS4 app, in
 
 ## What you need
 
-1. **A PS4 with GoldHEN.** Tested on an original PS4 ("fat" model). A PS4 Pro
-   or Slim should work too, but has not been tested.
+1. **A PS4 with GoldHEN.** Tested on an original PS4 ("fat" model) with
+   firmware 12.02 and GoldHEN 2.4b18. A PS4 Pro or Slim should work too, but
+   has not been tested. Older GoldHEN versions may not be able to read the
+   USB stick; then update GoldHEN.
 2. **A USB stick**, formatted as **exFAT** or **FAT32**.
 3. **Your Diddy Kong Racing ROM**:
    - the **US** or the **European** version, **Rev A** (also called "1.1"),
@@ -29,16 +31,16 @@ source port. It is not an emulator: the game runs as a normal PS4 app, in
 
 ## Install
 
-1. Download `DKR-xx.yy.pkg` from the
+1. Download `DKR-PS4-vX.Y.pkg` from the
    [Releases page](../../releases/latest).
 2. Copy these files onto the **top level** of the USB stick (not into a
    folder):
-   - `DKR-xx.yy.pkg`
+   - `DKR-PS4-vX.Y.pkg`
    - your ROM file
    - the two `.sprx` files (only if you need them, see above)
 3. Plug the stick into the PS4. Make sure GoldHEN is running.
 4. Open **Settings → Debug Settings → Game → Package Installer**, choose
-   `DKR-xx.yy.pkg` and install it.
+   `DKR-PS4-vX.Y.pkg` and install it.
 5. Start **Diddy Kong Racing** from the home screen. Leave the stick plugged
    in for the first start: the game copies the ROM (and the `.sprx` files, if
    they are on the stick) and shows a short message while it does so.
