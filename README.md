@@ -1,3 +1,8 @@
+> **This fork adds a native PS4 version** (GoldHEN homebrew).
+> Players: see **[PS4.md](PS4.md)** and download the `.pkg` from this fork's
+> [Releases](https://github.com/palrat/goldenballoon/releases/latest).
+> Everything else below is the original Golden Balloon README.
+
 <p align="center">
   <img src="dist/web/assets/hero.jpg" alt="Golden Balloon" width="820">
 </p>
