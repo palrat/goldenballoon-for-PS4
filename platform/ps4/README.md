@@ -23,7 +23,7 @@ cd goldenballoon
 
 # 1. Configure the desktop build once. The PS4 build reuses its source list
 #    and the third-party sources CMake downloads here; nothing has to be built.
-cmake -B build-gl -DCMAKE_BUILD_TYPE=Release
+cmake -B build-gl -DCMAKE_BUILD_TYPE=Release -DMDKR_WEBGPU_BACKEND=OFF
 
 # 2. Tell the scripts where the toolchain is.
 export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis/PS4Toolchain

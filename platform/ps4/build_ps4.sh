@@ -70,6 +70,11 @@ for e in data:
     if 'mdkr64.dir' not in (e.get('output') or ''):
         continue
     f = e['file']
+    # The native WebGPU backend (on by default on the desktop) has no PS4
+    # equivalent; gfx_webgpu_lifecycle.c is backend-neutral and stays.
+    name = pathlib.Path(f).name
+    if (name.startswith('gfx_webgpu') and name != 'gfx_webgpu_lifecycle.c'):
+        continue
     if f not in seen:
         seen.append(f)
 for f in sorted(seen):
