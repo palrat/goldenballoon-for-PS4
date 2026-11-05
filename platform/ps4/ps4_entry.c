@@ -347,6 +347,41 @@ static int locate_rom(char *rom, size_t cap, int *copied) {
     return 0;
 }
 
+/* A SELF's program type decides whether the loader accepts a module from
+ * /data: "fake" (1) loads, "system_dynlib" (9) is refused with 0x80020008,
+ * and both variants have the same size. Copies of the Piglet pair circulate
+ * in both forms, so an installed module is switched to "fake". The field sits
+ * 8 bytes into the SELF extended info, which follows the segment table, the
+ * ELF header and the program headers, aligned to 16. */
+static void self_make_fake(const char *path) {
+    FILE *f = fopen(path, "r+b");
+    if (f == NULL) return;
+    unsigned char hdr[0x20];
+    uint16_t entries = 0, phnum = 0;
+    uint64_t ptype = 0;
+    if (fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+        memcmp(hdr, "\x4F\x15\x3D\x1D", 4) == 0) {
+        memcpy(&entries, hdr + 0x18, sizeof(entries));
+        long elf = 0x20L + (long)entries * 0x20;
+        unsigned char ehdr[0x40];
+        if (fseek(f, elf, SEEK_SET) == 0 && fread(ehdr, 1, sizeof(ehdr), f) == sizeof(ehdr) &&
+            memcmp(ehdr, "\x7F" "ELF", 4) == 0) {
+            memcpy(&phnum, ehdr + 0x38, sizeof(phnum));
+            long at = ((elf + 0x40 + (long)phnum * 0x38 + 15) & ~15L) + 8;
+            if (fseek(f, at, SEEK_SET) == 0 && fread(&ptype, 1, sizeof(ptype), f) == sizeof(ptype)) {
+                fprintf(stderr, "[ps4]   program type 0x%llx\n", (unsigned long long)ptype);
+                if (ptype == 9) {
+                    uint64_t fake = 1;
+                    int ok = fseek(f, at, SEEK_SET) == 0 &&
+                             fwrite(&fake, 1, sizeof(fake), f) == sizeof(fake);
+                    fprintf(stderr, "[ps4]   switched to fake: %s\n", ok ? "ok" : "FAILED");
+                }
+            }
+        }
+    }
+    fclose(f);
+}
+
 /* Piglet (Sony's OpenGL ES) needs these two system modules. FTP uploads break
  * them, so take them from a USB stick when they are not installed yet. */
 static void install_modules_from_usb(void) {
@@ -358,8 +393,13 @@ static void install_modules_from_usb(void) {
         leave_sandbox();
         if (find_on_usb(kModules[i], src, sizeof(src))) {
             mkdir_p(MODULE_DIR);
+            int ok = copy_file(src, dst);
             fprintf(stderr, "[ps4] installing %s from %s: %s\n", kModules[i], src,
-                    copy_file(src, dst) ? "ok" : "FAILED");
+                    ok ? "ok" : "FAILED");
+            if (ok) {
+                self_make_fake(dst);
+                sceKernelChmod(dst, 0777);   /* same mode as a file manager copy */
+            }
         }
     }
     enter_sandbox();
