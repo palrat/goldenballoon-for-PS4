@@ -9,8 +9,8 @@ source port. It is not an emulator: the game runs as a normal PS4 app, in
 
 ## What you need
 
-1. **A PS4 with GoldHEN.** Tested on an original PS4 ("fat" model) with
-   firmware 12.02. A PS4 Pro or Slim should work too, but has not been tested.
+1. **A PS4 with GoldHEN.** Tested on an original PS4 ("fat" model). A PS4 Pro
+   or Slim should work too, but has not been tested.
 2. **A USB stick**, formatted as **exFAT** or **FAT32**.
 3. **Your Diddy Kong Racing ROM**:
    - the **US** or the **European** version, **Rev A** (also called "1.1"),
