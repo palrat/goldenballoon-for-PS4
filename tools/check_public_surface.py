@@ -28,6 +28,7 @@ NUL_ALLOWED_BINARY_SUFFIXES = frozenset(
         ".jpg",
         ".otf",
         ".png",
+        ".sfo",  # PS4 package metadata (platform/ps4/sce_sys_template)
         ".ttf",
         ".webp",
         ".woff",
